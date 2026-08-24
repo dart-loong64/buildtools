@@ -27,10 +27,18 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            ccache clang cmake git lld ninja-build \
+            ccache clang cmake git \
+            libxml2-dev \
+            lld ninja-build \
             g++-aarch64-linux-gnu \
             g++-loongarch64-linux-gnu \
             g++-riscv64-linux-gnu
+
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache
+          key: ${{ runner.os }}-${{ matrix.arch }}-${{ github.run_id }}
+          restore-keys: ${{ runner.os }}-${{ matrix.arch }}-
 
       - name: Build and package Clang
         run: |
