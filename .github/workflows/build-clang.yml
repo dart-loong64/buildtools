@@ -3,8 +3,8 @@ name: Build Flutter Clang
 on:
   workflow_dispatch:
     inputs:
-      llvm_revision:
-        description: LLVM commit to build
+      flutter_tag:
+        description: Flutter tag or commit to use
         required: true
         type: string
 
@@ -12,7 +12,107 @@ permissions:
   contents: read
 
 jobs:
+  source:
+    outputs:
+      llvm_revision: ${{ steps.flutter.outputs.llvm_revision }}
+      sysroot_cache_key: ${{ steps.sysroot-key.outputs.key }}
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Checkout Flutter sysroot manifest
+        uses: actions/checkout@v7
+        with:
+          repository: dart-loong64/flutter
+          ref: ${{ inputs.flutter_tag }}
+          path: flutter
+          sparse-checkout: |
+            DEPS
+            engine/src/build/linux/sysroot_scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Read Flutter LLVM revision
+        id: flutter
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import re
+
+          deps = open("flutter/DEPS", encoding="utf-8").read()
+          for name in ("llvm_revision", "clang_version"):
+            match = re.search(
+                rf"['\"]{name}['\"]\s*:\s*['\"](?:git_revision:)?([0-9a-f]{{40}})",
+                deps,
+            )
+            if match:
+              print(f"llvm_revision={match.group(1)}")
+              break
+          else:
+            raise SystemExit("Flutter DEPS does not contain llvm_revision or clang_version")
+          PY
+
+      - name: Restore Fuchsia cache
+        id: restore-fuchsia
+        uses: actions/cache/restore@v6
+        with:
+          path: fuchsia
+          key: fuchsia-${{ steps.flutter.outputs.llvm_revision }}
+
+      - name: Clone Fuchsia and checkout LLVM
+        if: steps.restore-fuchsia.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 https://fuchsia.googlesource.com/fuchsia
+          mkdir -p ./fuchsia/third_party
+          git clone --filter=blob:none --no-checkout \
+            https://llvm.googlesource.com/llvm-project \
+            ./fuchsia/third_party/llvm-project
+          git -C ./fuchsia/third_party/llvm-project fetch --depth=1 origin \
+            "${{ steps.flutter.outputs.llvm_revision }}"
+          git -C ./fuchsia/third_party/llvm-project checkout --detach \
+            "${{ steps.flutter.outputs.llvm_revision }}"
+
+      - name: Save Fuchsia cache
+        if: steps.restore-fuchsia.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: fuchsia
+          key: fuchsia-${{ steps.flutter.outputs.llvm_revision }}
+
+      - name: Restore Flutter sysroot cache
+        id: restore-sysroots
+        uses: actions/cache/restore@v6
+        with:
+          path: sysroots
+          key: flutter-sysroots-${{ inputs.flutter_tag }}-${{ hashFiles('flutter/engine/src/build/linux/sysroot_scripts/sysroots.json') }}
+
+      - name: Set Flutter sysroot cache key
+        id: sysroot-key
+        run: echo "key=flutter-sysroots-${{ inputs.flutter_tag }}-${{ hashFiles('flutter/engine/src/build/linux/sysroot_scripts/sysroots.json') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Download Flutter sysroots
+        if: steps.restore-sysroots.outputs.cache-hit != 'true'
+        run: |
+          for arch in amd64 arm64 loong64 riscv64; do
+            python3 flutter/engine/src/build/linux/sysroot_scripts/install-sysroot.py \
+              --arch="$arch"
+          done
+          mkdir -p sysroots
+          for sysroot in \
+            debian_bullseye_amd64-sysroot \
+            debian_bullseye_arm64-sysroot \
+            debian_trixie_loong64-sysroot \
+            debian_trixie_riscv64-sysroot; do
+            cp -a "flutter/engine/src/build/linux/$sysroot" sysroots/
+          done
+
+      - name: Save Flutter sysroot cache
+        if: steps.restore-sysroots.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: sysroots
+          key: ${{ steps.sysroot-key.outputs.key }}
+
   build:
+    needs: source
     runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
@@ -20,30 +120,42 @@ jobs:
         arch: ["amd64", "arm64", "loong64", "riscv64"]
 
     steps:
-      - name: Checkout buildtools
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+
+      - name: Restore Fuchsia cache
+        uses: actions/cache/restore@v6
+        with:
+          path: fuchsia
+          key: fuchsia-${{ needs.source.outputs.llvm_revision }}
+          fail-on-cache-miss: true
+
+      - name: Restore Flutter sysroot cache
+        uses: actions/cache/restore@v6
+        with:
+          path: sysroots
+          key: ${{ needs.source.outputs.sysroot_cache_key }}
+          fail-on-cache-miss: true
 
       - name: Install build and cross tools
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            ccache clang cmake git \
-            libxml2-dev \
+            clang cmake git \
             lld ninja-build \
             g++-aarch64-linux-gnu \
             g++-loongarch64-linux-gnu \
             g++-riscv64-linux-gnu
 
-      - uses: actions/cache@v6
-        with:
-          path: ~/.cache
-          key: ${{ runner.os }}-${{ matrix.arch }}-${{ github.run_id }}
-          restore-keys: ${{ runner.os }}-${{ matrix.arch }}-
+      - name: Prepare patch
+        run: |
+          cd fuchsia/third_party/llvm-project
+          git apply --check "${GITHUB_WORKSPACE}/patch_loong64.patch"
+          git apply "${GITHUB_WORKSPACE}/patch_loong64.patch"
 
       - name: Build and package Clang
         run: |
           ./build-clang.sh \
-            --llvm-revision "${{ inputs.llvm_revision }}" \
+            --llvm-revision "${{ needs.source.outputs.llvm_revision }}" \
             --arch "${{ matrix.arch }}"
 
       - name: Upload Clang archives

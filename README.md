@@ -1,10 +1,10 @@
 # buildtools
 
-The GitHub Actions workflow builds Fuchsia's two-stage Flutter Clang toolchain
-for amd64, arm64, loong64, and riscv64 on an x64 Ubuntu 26.04 runner. It installs the
-corresponding Linux cross compiler/sysroot, so the non-amd64 jobs produce
-target-architecture Clang binaries. Start it with **Actions → Build Flutter
-Clang → Run workflow** and provide the LLVM commit SHA.
+The GitHub Actions workflow first checks out the requested Flutter tag, reads
+its LLVM revision from `DEPS`, and prepares Fuchsia and its LLVM checkout once.
+It then builds Fuchsia's two-stage Flutter Clang toolchain for amd64, arm64,
+loong64, and riscv64 on x64 Ubuntu 26.04 runners. Start it with **Actions →
+Build Flutter Clang → Run workflow** and provide the Flutter tag or commit.
 
 The local entry point accepts only the two build parameters:
 
@@ -13,9 +13,12 @@ The local entry point accepts only the two build parameters:
   --arch loong64
 ```
 
-It clones Fuchsia, checks out the requested LLVM commit, patches the selected
-backend and Linux target into `Fuchsia-stage2.cmake`, then runs Fuchsia's
-`Fuchsia.cmake` bootstrap/stage2 targets. `FLUTTER_ROOT` is not required.
+It clones Fuchsia into `./fuchsia`, checks out the LLVM revision read from the
+Flutter `DEPS`, applies `patch_loong64.patch`, then runs Fuchsia's
+`Fuchsia.cmake` bootstrap/stage2 targets. The workflow invokes Flutter's
+`engine/src/build/linux/sysroot_scripts/install-sysroot.py` for the four target
+architectures and caches the resulting sysroots. `FLUTTER_ROOT` is not
+required.
 
 Each archive has an `llvm/` root, matching the downloaded Flutter toolchain
 layout. The temporary validation directory uses the same form as Flutter,
