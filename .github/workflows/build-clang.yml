@@ -1,0 +1,70 @@
+name: Build Flutter Clang
+
+on:
+  workflow_dispatch:
+    inputs:
+      llvm_revision:
+        description: LLVM commit to build
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ["amd64", "arm64", "loong64", "riscv64"]
+
+    steps:
+      - name: Checkout buildtools
+        uses: actions/checkout@v7
+
+      - name: Install build and cross tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ccache clang cmake git lld ninja-build \
+            g++-aarch64-linux-gnu \
+            g++-loongarch64-linux-gnu \
+            g++-riscv64-linux-gnu
+
+      - name: Build and package Clang
+        run: |
+          ./build-clang.sh \
+            --llvm-revision "${{ inputs.llvm_revision }}" \
+            --arch "${{ matrix.arch }}"
+
+      - name: Upload Clang archives
+        uses: actions/upload-artifact@v7
+        with:
+          name: clang-linux-${{ matrix.arch }}
+          path: dist/clang-linux-*.tar.*
+          if-no-files-found: error
+
+  release:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download Artifact
+        uses: actions/download-artifact@v8
+        with:
+          pattern: clang-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="$(date "+%Y%m%d")"
+          gh release create "${TAG_NAME}" \
+            --generate-notes \
+            --title "${TAG_NAME}" \
+            dist/*
