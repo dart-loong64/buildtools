@@ -1,5 +1,5 @@
 diff --git a/clang/cmake/caches/Fuchsia-stage2.cmake b/clang/cmake/caches/Fuchsia-stage2.cmake
-index de14bde2007a..7dce396d076d 100644
+index de14bde20..dc5f5dc13 100644
 --- a/clang/cmake/caches/Fuchsia-stage2.cmake
 +++ b/clang/cmake/caches/Fuchsia-stage2.cmake
 @@ -2,7 +2,7 @@
@@ -20,42 +20,8 @@ index de14bde2007a..7dce396d076d 100644
    if(LINUX_${target}_SYSROOT)
      # Set the per-target builtins options.
      list(APPEND BUILTIN_TARGETS "${target}")
-@@ -449,7 +449,7 @@ set(LLVM_RUNTIME_TARGETS "${RUNTIME_TARGETS}" CACHE STRING "")
- 
- # Setup toolchain.
- set(LLVM_INSTALL_TOOLCHAIN_ONLY ON CACHE BOOL "")
--set(LLVM_TOOLCHAIN_TOOLS
-+set(TOOLCHAIN_TOOLS
-   dsymutil
-   llvm-ar
-   llvm-cov
-@@ -466,7 +466,6 @@ set(LLVM_TOOLCHAIN_TOOLS
-   llvm-libtool-darwin
-   llvm-lipo
-   llvm-ml
--  llvm-mt
-   llvm-nm
-   llvm-objcopy
-   llvm-objdump
-@@ -485,8 +484,13 @@ set(LLVM_TOOLCHAIN_TOOLS
-   llvm-xray
-   opt-viewer
-   sancov
--  scan-build-py
--  CACHE STRING "")
-+  scan-build-py)
-+
-+if(LLVM_ENABLE_LIBXML2)
-+  list(APPEND TOOLCHAIN_TOOLS llvm-mt)
-+endif()
-+
-+set(LLVM_TOOLCHAIN_TOOLS "${TOOLCHAIN_TOOLS}" CACHE STRING "")
- 
- set(LLVM_Toolchain_DISTRIBUTION_COMPONENTS
-   bolt
-
 diff --git a/clang/cmake/caches/Fuchsia.cmake b/clang/cmake/caches/Fuchsia.cmake
-index 83ff4ccc167d..66a775f9abad 100644
+index 83ff4ccc1..66a775f9a 100644
 --- a/clang/cmake/caches/Fuchsia.cmake
 +++ b/clang/cmake/caches/Fuchsia.cmake
 @@ -2,7 +2,7 @@

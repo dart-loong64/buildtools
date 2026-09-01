@@ -1,189 +1,166 @@
 #!/usr/bin/env bash
-# Build a Fuchsia two-stage Clang distribution for one host architecture.
-# The script intentionally accepts only --llvm-revision and --arch.
-
+# Builds an x86_64-hosted Fuchsia clang with Linux cross-compilation targets.
 set -euo pipefail
-IFS=$'\n\t'
 
-readonly FUCHSIA_URL='https://fuchsia.googlesource.com/fuchsia'
-readonly LLVM_URL='https://llvm.googlesource.com/llvm-project'
-readonly ROOT_DIR="$PWD"
-readonly DIST_DIR="$ROOT_DIR/dist"
-readonly JOBS="${JOBS:-$(nproc)}"
-
-usage() {
-  cat >&2 <<'EOF'
-Usage:
-  build-clang.sh --llvm-revision <40-character-commit> \
-    --arch <amd64|arm64|loong64|riscv64>
-EOF
-}
-
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
-
-[[ $# -eq 4 ]] || { usage; exit 2; }
-if [[ "$1" == '--llvm-revision' && "$3" == '--arch' ]]; then
-  llvm_revision="$2"
-  arch="$4"
-elif [[ "$1" == '--arch' && "$3" == '--llvm-revision' ]]; then
-  arch="$2"
-  llvm_revision="$4"
-else
-  usage
-  die 'only --llvm-revision and --arch are accepted'
-fi
-
-[[ "$llvm_revision" =~ ^[[:xdigit:]]{40}$ ]] ||
-  die 'LLVM revision must be a 40-character SHA'
-
-case "$arch" in
-  amd64)
-    target_triple='x86_64-unknown-linux-gnu'
-    package_arch='x64'
-    target_processor='x86_64'
-    llvm_backend='X86'
-    elf_machine='Advanced Micro Devices X86-64'
-    sysroot_name='debian_bullseye_amd64-sysroot'
-    ;;
-  arm64)
-    target_triple='aarch64-unknown-linux-gnu'
-    package_arch='arm64'
-    target_processor='aarch64'
-    llvm_backend='AArch64'
-    elf_machine='AArch64'
-    sysroot_name='debian_bullseye_arm64-sysroot'
-    ;;
-  loong64)
-    target_triple='loongarch64-unknown-linux-gnu'
-    package_arch='loong64'
-    target_processor='loongarch64'
-    llvm_backend='LoongArch'
-    elf_machine='LoongArch'
-    sysroot_name='debian_trixie_loong64-sysroot'
-    ;;
-  riscv64)
-    target_triple='riscv64-unknown-linux-gnu'
-    package_arch='riscv64'
-    target_processor='riscv64'
-    llvm_backend='RISCV'
-    elf_machine='RISC-V'
-    sysroot_name='debian_trixie_riscv64-sysroot'
-    ;;
-  *)
-    die "unsupported architecture: $arch"
-    ;;
+arch=$(uname -m)
+case "${arch}" in
+  x86_64) build_arch=x64 ;;
+  aarch64) build_arch=arm64 ;;
+  loongarch64) build_arch=loong64 ;;
+  *) build_arch="${arch}" ;;
 esac
 
-sysroot="$ROOT_DIR/sysroots/$sysroot_name"
+jobs="${JOBS:-$(nproc)}"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+flutter_root="$(cd "${script_dir}/../../../.." && pwd)"
+depot_tools="${flutter_root}/tmp/depot_tools"
+fuchsia_dir="${flutter_root}/tmp/fuchsia"
+llvm_src="${fuchsia_dir}/third_party/llvm-project"
+build_dir="${flutter_root}/tmp/flutter-clang-build"
+package_dir="${flutter_root}/dist"
+install_dir="$(mktemp -d /tmp/flutter-clang-${build_arch}.XXXXXX)"
 
-for command_name in cmake file git grep head mktemp ninja nproc readelf sed strings tar xz; do
-  command -v "$command_name" >/dev/null || die "missing command: $command_name"
+depot_tools_repo="https://chromium.googlesource.com/chromium/tools/depot_tools.git"
+fuchsia_repo="https://fuchsia.googlesource.com/fuchsia"
+
+mkdir -p "${build_dir}"
+
+if [[ ! -e "${depot_tools}" ]]; then
+  mkdir -p "$(dirname "${depot_tools}")"
+  git clone --depth 1 "${depot_tools_repo}" "${depot_tools}"
+elif [[ ! -d "${depot_tools}/.git" ]]; then
+  echo "${depot_tools} exists but is not a depot_tools git checkout" >&2
+  exit 1
+fi
+export PATH="${depot_tools}:${PATH}"
+
+if [[ ! -e "${fuchsia_dir}" ]]; then
+  git clone --depth 1 "${fuchsia_repo}" "${fuchsia_dir}"
+elif [[ ! -d "${fuchsia_dir}/.git" ]]; then
+  echo "${fuchsia_dir} exists but is not a Fuchsia git checkout" >&2
+  exit 1
+fi
+
+engine_src="${flutter_root}/engine/src"
+x64_sysroot="${engine_src}/build/linux/debian_bullseye_amd64-sysroot"
+x86_sysroot="${engine_src}/build/linux/debian_bullseye_i386-sysroot"
+arm_sysroot="${engine_src}/build/linux/debian_bullseye_armhf-sysroot"
+arm64_sysroot="${engine_src}/build/linux/debian_bullseye_arm64-sysroot"
+loong64_sysroot="${engine_src}/build/linux/debian_trixie_loong64-sysroot"
+riscv64_sysroot="${engine_src}/build/linux/debian_trixie_riscv64-sysroot"
+
+command -v cmake >/dev/null
+command -v ninja >/dev/null
+command -v pkg-config >/dev/null
+if ! pkg-config --exists libxml-2.0; then
+  echo "libxml2 development files are required (install libxml2-dev)" >&2
+  exit 1
+fi
+
+clang_revision="$(sed -n "s/.*'clang_version': 'git_revision:\([0-9a-f]\{40\}\)'.*/\1/p" "${flutter_root}/DEPS")"
+if [[ ! "${clang_revision}" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "unable to read clang_version from ${flutter_root}/DEPS" >&2
+  exit 1
+fi
+
+if [[ ! -e "${llvm_src}" ]]; then
+  mkdir -p "$(dirname "${llvm_src}")"
+  git clone --depth 1 https://llvm.googlesource.com/llvm-project "${llvm_src}"
+elif [[ ! -d "${llvm_src}/.git" ]]; then
+  echo "${llvm_src} exists but is not an LLVM git checkout" >&2
+  exit 1
+fi
+
+if [[ "$(git -C "${llvm_src}" rev-parse HEAD)" != "${clang_revision}" ]]; then
+  if [[ -n "$(git -C "${llvm_src}" status --porcelain)" ]]; then
+    echo "${llvm_src} has uncommitted changes; refusing to switch revisions" >&2
+    exit 1
+  fi
+  git -C "${llvm_src}" fetch --depth 1 origin "${clang_revision}"
+  git -C "${llvm_src}" checkout --detach "${clang_revision}"
+fi
+
+stage1_cmake="${llvm_src}/clang/cmake/caches/Fuchsia.cmake"
+stage2_cmake="${llvm_src}/clang/cmake/caches/Fuchsia-stage2.cmake"
+test -f "${stage1_cmake}"
+test -f "${stage2_cmake}"
+if ! grep -Eq 'LLVM_TARGETS_TO_BUILD.*LoongArch' "${stage1_cmake}"; then
+  git -C "${llvm_src}" apply - <<'PATCH'
+diff --git a/clang/cmake/caches/Fuchsia.cmake b/clang/cmake/caches/Fuchsia.cmake
+--- a/clang/cmake/caches/Fuchsia.cmake
++++ b/clang/cmake/caches/Fuchsia.cmake
+@@ -2,6 +2,6 @@
+ 
+ option(FUCHSIA_ENABLE_LLDB "Enable LLDB")
+ 
+-set(LLVM_TARGETS_TO_BUILD X86;ARM;AArch64;RISCV CACHE STRING "")
++set(LLVM_TARGETS_TO_BUILD X86;ARM;AArch64;RISCV;LoongArch CACHE STRING "")
+ 
+ set(PACKAGE_VENDOR Fuchsia CACHE STRING "")
+PATCH
+fi
+
+if ! grep -Eq 'LLVM_TARGETS_TO_BUILD.*LoongArch' "${stage2_cmake}" || \
+  ! grep -q 'loongarch64-unknown-linux-gnu' "${stage2_cmake}"; then
+  git -C "${llvm_src}" apply - <<'PATCH'
+diff --git a/clang/cmake/caches/Fuchsia-stage2.cmake b/clang/cmake/caches/Fuchsia-stage2.cmake
+--- a/clang/cmake/caches/Fuchsia-stage2.cmake
++++ b/clang/cmake/caches/Fuchsia-stage2.cmake
+@@ -2,6 +2,6 @@
+ 
+ option(FUCHSIA_ENABLE_LLDB "Enable LLDB")
+ 
+-set(LLVM_TARGETS_TO_BUILD X86;ARM;AArch64;RISCV CACHE STRING "")
++set(LLVM_TARGETS_TO_BUILD X86;ARM;AArch64;RISCV;LoongArch CACHE STRING "")
+ 
+ set(PACKAGE_VENDOR Fuchsia CACHE STRING "")
+@@ -138,6 +138,6 @@
+   set(RUNTIMES_${target}_CMAKE_MODULE_LINKER_FLAGS ${WINDOWS_LINK_FLAGS} CACHE STRING "")
+ endif()
+ 
+-foreach(target aarch64-unknown-linux-gnu;armv7-unknown-linux-gnueabihf;i386-unknown-linux-gnu;riscv64-unknown-linux-gnu;x86_64-unknown-linux-gnu)
++foreach(target aarch64-unknown-linux-gnu;armv7-unknown-linux-gnueabihf;i386-unknown-linux-gnu;loongarch64-unknown-linux-gnu;riscv64-unknown-linux-gnu;x86_64-unknown-linux-gnu)
+   if(LINUX_${target}_SYSROOT)
+     # Set the per-target builtins options.
+PATCH
+fi
+
+sysroot_installer="${engine_src}/build/linux/sysroot_scripts/install-sysroot.py"
+for arch in x64 x86 arm arm64 loong64 riscv64; do
+  echo "fetching ${arch} Linux sysroot"
+  python3 "${sysroot_installer}" --arch="${arch}"
 done
-[[ -d "$sysroot" ]] || die "cross sysroot is missing: $sysroot"
+for sysroot in "${x64_sysroot}" "${x86_sysroot}" "${arm_sysroot}" \
+  "${arm64_sysroot}" "${loong64_sysroot}" "${riscv64_sysroot}"; do
+  test -f "${sysroot}/.stamp"
+done
 
-mkdir -p "$DIST_DIR"
-fuchsia_root="$ROOT_DIR/fuchsia"
-
-build_root="$(mktemp -d "${TMPDIR:-/tmp}/fuchsia-clang-${arch}.XXXXXX")"
-cleanup() {
-  rm -rf "$build_root"
-}
-trap cleanup EXIT
-
-llvm_source="$fuchsia_root/third_party/llvm-project"
-if [[ -d "$fuchsia_root/.git" ]]; then
-  echo "==> Using cached Fuchsia: $fuchsia_root"
-else
-  [[ ! -e "$fuchsia_root" ]] || die "invalid Fuchsia directory: $fuchsia_root"
-  echo "==> Cloning Fuchsia"
-  git clone --depth=1 "$FUCHSIA_URL" "$fuchsia_root"
-fi
-
-if [[ -d "$llvm_source/.git" ]]; then
-  actual_llvm_revision="$(git -C "$llvm_source" rev-parse HEAD)"
-  [[ "$actual_llvm_revision" == "$llvm_revision" ]] ||
-    die "cached LLVM revision mismatch: expected $llvm_revision, got $actual_llvm_revision"
-  echo "==> Using cached LLVM revision $llvm_revision"
-else
-  echo "==> Cloning LLVM at $llvm_revision"
-  mkdir -p "$(dirname "$llvm_source")"
-  git clone --filter=blob:none --no-checkout "$LLVM_URL" "$llvm_source"
-  git -C "$llvm_source" fetch --depth=1 origin "$llvm_revision"
-  git -C "$llvm_source" checkout --detach "$llvm_revision"
-fi
-
-stage2_cache="$llvm_source/clang/cmake/caches/Fuchsia-stage2.cmake"
-[[ -f "$stage2_cache" ]] || die "missing stage2 cache: $stage2_cache"
-
-all_llvm_targets="$(sed -nE 's/^set\(LLVM_TARGETS_TO_BUILD ([^ ]+) CACHE STRING.*/\1/p' "$stage2_cache")"
-grep -q "$llvm_backend" <<< "$all_llvm_targets" ||
-  die "${llvm_backend} backend patch was not applied"
-
-build_dir="$fuchsia_root/out/clang-$arch"
-install_dir="$build_root/install"
-fuchsia_cache="$llvm_source/clang/cmake/caches/Fuchsia.cmake"
-stage2_args="-C;${stage2_cache};-DCMAKE_SYSTEM_NAME=Linux;-DCMAKE_SYSTEM_PROCESSOR=${target_processor};-DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY;-DBOOTSTRAP_CMAKE_SYSTEM_NAME=Linux;-DBOOTSTRAP_CMAKE_SYSTEM_PROCESSOR=${target_processor};-DBOOTSTRAP_CMAKE_C_COMPILER_TARGET=${target_triple};-DBOOTSTRAP_CMAKE_CXX_COMPILER_TARGET=${target_triple};-DBOOTSTRAP_CMAKE_ASM_COMPILER_TARGET=${target_triple};-DCMAKE_C_COMPILER_TARGET=${target_triple};-DCMAKE_CXX_COMPILER_TARGET=${target_triple};-DCMAKE_ASM_COMPILER_TARGET=${target_triple};-DLLVM_HOST_TRIPLE=${target_triple};-DCLANG_DEFAULT_TARGET_TRIPLE=${target_triple};-DLINUX_${target_triple}_SYSROOT=${sysroot};-DCMAKE_SYSROOT=${sysroot}"
-
-echo '==> Configuring Fuchsia bootstrap/stage2 build'
-cmake -S "$llvm_source/llvm" -B "$build_dir" -G Ninja \
-  -C "$fuchsia_cache" \
+cmake -S "${llvm_src}/llvm" -B "${build_dir}" -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLVM_ENABLE_LIBXML2=ON \
+  -DLLVM_PARALLEL_LINK_JOBS=1 \
+  -DSTAGE2_LLVM_PARALLEL_LINK_JOBS=1 \
+  -DSTAGE2_LINUX_x86_64-unknown-linux-gnu_SYSROOT="${x64_sysroot}" \
+  -DSTAGE2_LINUX_i386-unknown-linux-gnu_SYSROOT="${x86_sysroot}" \
+  -DSTAGE2_LINUX_armv7-unknown-linux-gnueabihf_SYSROOT="${arm_sysroot}" \
+  -DSTAGE2_LINUX_aarch64-unknown-linux-gnu_SYSROOT="${arm64_sysroot}" \
+  -DSTAGE2_LINUX_loongarch64-unknown-linux-gnu_SYSROOT="${loong64_sysroot}" \
+  -DSTAGE2_LINUX_riscv64-unknown-linux-gnu_SYSROOT="${riscv64_sysroot}" \
   -DCMAKE_INSTALL_PREFIX= \
-  -DSTAGE2_LINUX_${target_triple}_SYSROOT="$sysroot" \
-  -DCLANG_BOOTSTRAP_CMAKE_ARGS="$stage2_args" \
-  -DLLVM_TARGETS_TO_BUILD="$all_llvm_targets" \
-  -DLLVM_DEFAULT_TARGET_TRIPLE="$target_triple" \
-  -DCLANG_REPOSITORY_STRING="$LLVM_URL $llvm_revision" \
-  -DLLVM_FORCE_VC_REPOSITORY="$LLVM_URL" \
-  -DLLVM_FORCE_VC_REVISION="$llvm_revision"
+  -C "${stage1_cmake}"
 
-echo '==> Building bootstrap and stage2 distribution'
-ninja -C "$build_dir" -j"$JOBS" stage2-toolchain-distribution
-DESTDIR="$install_dir" ninja -C "$build_dir" -j"$JOBS" \
-  stage2-install-toolchain-distribution-stripped
+ninja -C "${build_dir}" stage2-toolchain-distribution -j"${jobs}"
+DESTDIR="${install_dir}" ninja -C "${build_dir}" \
+  stage2-install-toolchain-distribution-stripped -j"${jobs}"
 
-[[ -x "$install_dir/bin/clang" ]] || die 'stage2 clang was not installed'
-clang_dir="$(mktemp -d "/tmp/flutter-clang-$package_arch.XXXXXX")"
-archive_stage="$(mktemp -d "/tmp/clang-linux-$package_arch-archive.XXXXXX")"
-trap 'rm -rf "$build_root" "$archive_stage"' EXIT
-cp -a "$install_dir"/. "$clang_dir"/
+"${install_dir}/bin/clang" --version
+printf 'int main(void) { return 0; }\n' | "${install_dir}/bin/clang" \
+  --target=loongarch64-unknown-linux-gnu -x c -c - -o "${build_dir}/loongarch-test.o"
+readelf -h "${build_dir}/loongarch-test.o" | grep -F 'Machine:                           LoongArch'
 
-if [[ "$arch" == 'amd64' ]]; then
-  clang_version="$($clang_dir/bin/clang --version)"
-  echo "$clang_version"
-  grep -q "Fuchsia clang version .* $llvm_revision" <<< "$clang_version" ||
-    die 'clang revision mismatch'
-  grep -q "Target: $target_triple" <<< "$clang_version" ||
-    die "clang target mismatch: expected $target_triple"
-  grep -q "InstalledDir: $clang_dir/bin" <<< "$clang_version" ||
-    die 'clang InstalledDir mismatch'
-else
-  elf_header="$(readelf -h "$clang_dir/bin/clang")"
-  grep -q "Machine:.*${elf_machine}" <<< "$elf_header" ||
-    die "clang ELF machine mismatch: expected $elf_machine"
-  file "$clang_dir/bin/clang"
-  strings "$clang_dir/bin/clang" | grep -q "$llvm_revision" ||
-    die 'clang revision is missing from the cross-built binary'
-fi
+mkdir -p "${package_dir}"
+tar -C "${install_dir}" -czf "${package_dir}/clang-linux-${build_arch}.tar.gz" .
+tar -C "${install_dir}" -cJf "${package_dir}/clang-linux-${build_arch}.tar.xz" .
 
-archive_root='llvm'
-mkdir "$archive_stage/$archive_root"
-cp -a "$clang_dir"/. "$archive_stage/$archive_root"/
-gzip_archive="$DIST_DIR/clang-linux-$package_arch.tar.gz"
-xz_archive="$DIST_DIR/clang-linux-$package_arch.tar.xz"
-
-echo "==> Creating $gzip_archive"
-tar -C "$archive_stage" --numeric-owner -czf "$gzip_archive" "$archive_root"
-echo "==> Creating $xz_archive"
-tar -C "$archive_stage" --numeric-owner -I 'xz -T0 -6' \
-  -cf "$xz_archive" "$archive_root"
-
-[[ "$(tar -tzf "$gzip_archive" | head -1)" == "$archive_root/" ]] ||
-  die 'bad gzip archive root'
-[[ "$(tar -tJf "$xz_archive" | head -1)" == "$archive_root/" ]] ||
-  die 'bad xz archive root'
-
-echo '==> Complete'
-ls -lh "$gzip_archive" "$xz_archive"
+printf 'install: %s\narchive: %s/clang-linux-${build_arch}.{tar.gz,tar.xz}\n' \
+  "${install_dir}" "${package_dir}"
