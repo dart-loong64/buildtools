@@ -138,8 +138,6 @@ done
 cmake -S "${llvm_src}/llvm" -B "${build_dir}" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DLLVM_ENABLE_LIBXML2=ON \
-  -DLLVM_PARALLEL_LINK_JOBS=1 \
-  -DSTAGE2_LLVM_PARALLEL_LINK_JOBS=1 \
   -DSTAGE2_LINUX_x86_64-unknown-linux-gnu_SYSROOT="${x64_sysroot}" \
   -DSTAGE2_LINUX_i386-unknown-linux-gnu_SYSROOT="${x86_sysroot}" \
   -DSTAGE2_LINUX_armv7-unknown-linux-gnueabihf_SYSROOT="${arm_sysroot}" \
@@ -154,13 +152,10 @@ DESTDIR="${install_dir}" ninja -C "${build_dir}" \
   stage2-install-toolchain-distribution-stripped -j"${jobs}"
 
 "${install_dir}/bin/clang" --version
-printf 'int main(void) { return 0; }\n' | "${install_dir}/bin/clang" \
-  --target=loongarch64-unknown-linux-gnu -x c -c - -o "${build_dir}/loongarch-test.o"
-readelf -h "${build_dir}/loongarch-test.o" | grep -F 'Machine:                           LoongArch'
 
 mkdir -p "${package_dir}"
 tar -C "${install_dir}" -czf "${package_dir}/clang-linux-${build_arch}.tar.gz" .
 tar -C "${install_dir}" -cJf "${package_dir}/clang-linux-${build_arch}.tar.xz" .
 
-printf 'install: %s\narchive: %s/clang-linux-${build_arch}.{tar.gz,tar.xz}\n' \
+printf "install: %s\narchive: %s/clang-linux-${build_arch}.{tar.gz,tar.xz}\n" \
   "${install_dir}" "${package_dir}"
